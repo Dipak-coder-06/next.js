@@ -226,7 +226,7 @@ describe('use-cache-custom-handler', () => {
   // Development serves front-cache hits before reconciling the backing cache.
   // Its serialized backing reads cannot reach both held lookups concurrently.
   // @force-gate start
-  it('currently shares a handler lookup across routes and serves old data after revalidatePath()', async () => {
+  it('regenerates data for a revalidated route while another route reads the same cache entry', async () => {
     const control = (action: string) =>
       next.fetch('/path-revalidation', { method: 'POST', body: action })
     const readLookupState = () =>
@@ -271,13 +271,15 @@ describe('use-cache-custom-handler', () => {
         routeARendering,
         routeBRendering,
       ])
-      // B currently reuses A's handler result despite `revalidatePath()`. Only
-      // A's implicit tags reach `get()`.
+      // A must return the existing value. B must generate a new value because
+      // its implicit tags were revalidated. Each `get()` must receive its own
+      // route's implicit tags.
       expect(routeAPage('#data').text()).toBe(initial)
-      expect(routeBPage('#data').text()).toBe(initial)
+      expect(routeBPage('#data').text()).not.toBe(initial)
       expect(routeBPage('#data').text()).not.toBe('')
       expect((await readLookupState()).softTags).toEqual([
         expect.arrayContaining(['_N_T_/path-revalidation/a/page']),
+        expect.arrayContaining(['_N_T_/path-revalidation/b/page']),
       ])
     } finally {
       await control('release-entry-lookup')
@@ -288,7 +290,7 @@ describe('use-cache-custom-handler', () => {
   // This test controls when the custom handler's `get()` returns. Development
   // can serve an entry from its in-memory handler before that call completes.
   // @force-gate start
-  it('currently shares a pending fill without checking route-specific cache invalidation', async () => {
+  it('respects a route-specific handler miss after an observed fill finishes during lookup', async () => {
     const id = `observed-miss-${randomUUID()}`
     const pathname = `/path-revalidation?id=${id}`
     const control = (action: string) =>
@@ -336,17 +338,17 @@ describe('use-cache-custom-handler', () => {
       await retry(async () => {
         expect((await readState()).writes).toHaveLength(2)
       })
-      // B currently joins A's generated result without calling `get()`. The
-      // empty `pausedLookupKeys` array confirms that B skipped its own lookup.
+      // B must generate its own value after `get()` returns `undefined`. It
+      // must not reuse A's completed generation, which began before B was
+      // revalidated.
       await control('release-route-lookup-result')
       const routeBPage = await routeBRendering
-      expect(routeBPage('#data').text()).toBe(refreshed)
+      expect(routeBPage('#data').text()).not.toBe(refreshed)
       expect(routeBPage('#data').text()).not.toBe('')
       await retry(async () => {
         const state = await readState()
-        expect(state.pausedLookupKeys).toHaveLength(0)
-        expect(state.fills).toHaveLength(2)
-        expect(state.writes).toHaveLength(2)
+        expect(state.fills).toHaveLength(3)
+        expect(state.writes).toHaveLength(3)
       })
     } finally {
       await control('release-fill')
