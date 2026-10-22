@@ -1,0 +1,21 @@
+[package]
+name = "turbo-bitset"
+version = "0.1.0"
+description = "A fast bitset over a bounded, block-aligned bit range"
+license = "MIT"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+fixedbitset = { workspace = true }
+roaring = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+rustc-hash = { workspace = true }
+
+[[bench]]
+name = "mod"
+harness = false

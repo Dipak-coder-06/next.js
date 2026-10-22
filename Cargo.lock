@@ -9063,6 +9063,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "turbo-bitset"
+version = "0.1.0"
+dependencies = [
+ "codspeed-criterion-compat",
+ "fixedbitset",
+ "roaring",
+ "rustc-hash 2.1.1",
+]
+
+[[package]]
 name = "turbo-dyn-eq-hash"
 version = "0.0.1"
 
@@ -9641,6 +9651,7 @@ dependencies = [
  "tokio",
  "tracing",
  "turbo-bincode",
+ "turbo-bitset",
  "turbo-esregex",
  "turbo-frozenmap",
  "turbo-prehash",
