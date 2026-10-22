@@ -126,7 +126,7 @@ pub async fn collect_graph(graph: Vc<ModuleGraph>) -> Result<Vc<CollectedModules
                     bail!("Module entry membership not found");
                 };
 
-                if current_membership.is_empty() {
+                if current_membership.is_zero() {
                     // Initial visit, clone instead of merging
                     *current_membership = parent_membership.clone();
                     Ok(GraphTraversalAction::Continue)
@@ -157,7 +157,7 @@ pub async fn collect_graph(graph: Vc<ModuleGraph>) -> Result<Vc<CollectedModules
             .get(&collecting_module)
             .context("Module entry membership not found")?;
 
-        if collecting_membership.len() > 1 {
+        if collecting_membership.count_ones() > 1 {
             ModuleIssue::new(
                 *collecting_module.ident().to_resolved().await?,
                 rcstr!("Invalid use of __turbopack_collect__"),
