@@ -217,7 +217,7 @@ pub async fn compute_merged_modules(module_graph: Vc<ModuleGraph>) -> Result<Vc<
                         bail!("unreachable except for eventual consistency");
                     };
 
-                    if current_merged_groups.is_empty() {
+                    if current_merged_groups.is_zero() {
                         // Initial visit, clone instead of merging
                         *current_merged_groups = parent_merged_groups.clone();
                         GraphTraversalAction::Continue
