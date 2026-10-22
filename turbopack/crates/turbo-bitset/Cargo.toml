@@ -9,11 +9,11 @@ edition = "2024"
 workspace = true
 
 [dependencies]
-fixedbitset = { workspace = true }
 roaring = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+fixedbitset = { workspace = true }
 rustc-hash = { workspace = true }
 
 [[bench]]

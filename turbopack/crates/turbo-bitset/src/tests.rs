@@ -11,8 +11,8 @@ fn check(set: &OffsetBitset, expected: &BTreeSet<u32>) {
         set.iter().collect::<Vec<_>>(),
         expected.iter().copied().collect::<Vec<_>>()
     );
-    assert_eq!(set.len(), expected.len());
-    assert_eq!(set.is_empty(), expected.is_empty());
+    assert_eq!(set.count_ones(), expected.len());
+    assert_eq!(set.is_zero(), expected.is_empty());
     for &bit in expected {
         assert!(set.contains(bit), "missing {bit}");
     }
@@ -43,6 +43,11 @@ fn check(set: &OffsetBitset, expected: &BTreeSet<u32>) {
 
 fn hash(set: &OffsetBitset) -> u64 {
     FxBuildHasher.hash_one(set)
+}
+
+/// The pointer and capacity of the storage, to check whether it was reallocated.
+fn storage(set: &OffsetBitset) -> (*const usize, usize) {
+    (set.blocks.as_ptr(), set.blocks.capacity())
 }
 
 fn from_bits(bits: &[u32]) -> (OffsetBitset, BTreeSet<u32>) {
@@ -99,6 +104,64 @@ fn front_and_back_growth() {
     // High first, then progressively lower and higher bits.
     for bit in [10_000, 9_000, 20_000, 64, 63, 0, 100_000, 99_999] {
         assert_eq!(set.insert(bit), expected.insert(bit));
+        check(&set, &expected);
+    }
+}
+
+#[test]
+fn front_growth_reuses_capacity() {
+    let block = usize::BITS;
+    let mut set = OffsetBitset::new();
+    let mut expected = BTreeSet::new();
+    for bit in [100 * block + 3, 101 * block] {
+        set.insert(bit);
+        expected.insert(bit);
+    }
+    // Leave room for 8 more blocks.
+    set.blocks.reserve(8);
+    let (ptr, capacity) = storage(&set);
+    assert!(capacity >= 10);
+
+    // Growing at the front within the capacity doesn't reallocate.
+    for bit in [99 * block + 7, 96 * block, 99 * block - 1, 95 * block + 1] {
+        assert_eq!(set.insert(bit), expected.insert(bit));
+        check(&set, &expected);
+        assert_eq!(storage(&set), (ptr, capacity));
+    }
+    // Growing at the front and the back at once within the capacity doesn't reallocate either.
+    let other = [94 * block, 102 * block + 5]
+        .into_iter()
+        .collect::<OffsetBitset>();
+    set |= &other;
+    expected.extend(other.iter());
+    check(&set, &expected);
+    assert_eq!(storage(&set), (ptr, capacity));
+
+    // Growing beyond the reserved capacity keeps all bits.
+    let bit = 10 * block + 1;
+    assert!(set.insert(bit));
+    expected.insert(bit);
+    check(&set, &expected);
+}
+
+#[test]
+fn front_and_back_growth_in_one_step() {
+    let block = usize::BITS;
+    for reserve in [0, 2, 100] {
+        let mut set = [10 * block, 11 * block - 1]
+            .into_iter()
+            .collect::<OffsetBitset>();
+        set.blocks.reserve(reserve);
+        let mut expected = set.iter().collect::<BTreeSet<_>>();
+        // A union that extends the range below and above.
+        let other = [3 * block + 2, 10 * block, 20 * block + 9];
+        set |= &other.into_iter().collect::<OffsetBitset>();
+        expected.extend(other);
+        check(&set, &expected);
+        // Extending below and above.
+        let more = [block, 2 * block - 1, 30 * block];
+        set.extend(more);
+        expected.extend(more);
         check(&set, &expected);
     }
 }
@@ -211,10 +274,12 @@ fn equal_sets_with_different_storage_ranges() {
     let a = [3_000, 3_001].into_iter().collect::<OffsetBitset>();
     let block = usize::BITS as usize;
     let offset = 3_000 / block - 2;
-    let mut bits = fixedbitset::FixedBitSet::with_capacity(6 * block);
-    bits.insert(3_000 - offset * block);
-    bits.insert(3_001 - offset * block);
-    let wide = OffsetBitset { offset, bits };
+    let mut blocks = vec![0usize; 6];
+    for bit in [3_000, 3_001] {
+        let bit = bit - offset * block;
+        blocks[bit / block] |= 1 << (bit % block);
+    }
+    let wide = OffsetBitset { offset, blocks };
     check(&wide, &[3_000, 3_001].into());
     assert_eq!(a, wide);
     assert_eq!(hash(&a), hash(&wide));
@@ -225,7 +290,7 @@ fn equal_sets_with_different_storage_ranges() {
     // An empty set with allocated storage equals the default empty set.
     let empty_wide = OffsetBitset {
         offset: 10,
-        bits: fixedbitset::FixedBitSet::with_capacity(3 * block),
+        blocks: vec![0; 3],
     };
     check(&empty_wide, &BTreeSet::new());
     assert_eq!(empty_wide, OffsetBitset::new());

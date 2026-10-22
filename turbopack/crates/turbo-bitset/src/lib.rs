@@ -1,7 +1,7 @@
 //! A fast bitset for algorithms that work on a bounded range of `u32` indices.
 //!
-//! [`OffsetBitset`] stores its bits in a [`FixedBitSet`], but only from the first used `usize`
-//! block on: the bitset keeps an offset (counted in whole blocks) and stores bit `i` at
+//! [`OffsetBitset`] stores its bits in `usize` blocks, but only from the first used block on: the
+//! bitset keeps an offset (counted in whole blocks) and stores bit `i` at
 //! `i - offset * usize::BITS`. A set whose bits are clustered at high indices therefore doesn't
 //! allocate the empty blocks below them.
 //!
@@ -15,14 +15,13 @@ use std::{
     ops::BitOrAssign,
 };
 
-use fixedbitset::FixedBitSet;
 use roaring::RoaringBitmap;
 
 /// Number of bits per storage block.
 const BLOCK_BITS: usize = usize::BITS as usize;
 
-/// A set of `u32` indices backed by a [`FixedBitSet`] that only covers the block-aligned range
-/// between the lowest and the highest stored bit.
+/// A set of `u32` indices stored as `usize` blocks that only cover the block-aligned range between
+/// the lowest and the highest stored bit.
 ///
 /// The storage grows at the front or the back when a bit outside of the current range is
 /// inserted. Equality and hashing only depend on which bits are set, not on the storage range.
@@ -31,8 +30,8 @@ pub struct OffsetBitset {
     /// The index of the first stored block, i.e. the first stored bit is
     /// `offset * usize::BITS`.
     offset: usize,
-    /// The stored blocks. Its length is always a multiple of [`BLOCK_BITS`].
-    bits: FixedBitSet,
+    /// The stored blocks. Bit `i` of block `j` is the bit `(offset + j) * usize::BITS + i`.
+    blocks: Vec<usize>,
 }
 
 impl OffsetBitset {
@@ -40,14 +39,14 @@ impl OffsetBitset {
     pub const fn new() -> Self {
         Self {
             offset: 0,
-            bits: FixedBitSet::new(),
+            blocks: Vec::new(),
         }
     }
 
     /// The stored blocks.
     #[inline]
     fn blocks(&self) -> &[usize] {
-        self.bits.as_slice()
+        &self.blocks
     }
 
     /// The index of the block after the last stored block.
@@ -69,26 +68,26 @@ impl OffsetBitset {
     }
 
     /// Makes sure that the blocks `start..end` are stored, keeping all existing bits.
+    ///
+    /// This reuses the spare capacity of the storage when the new range fits into it, also when
+    /// growing at the front. Otherwise it reallocates with amortized growth.
     fn ensure_blocks(&mut self, start: usize, end: usize) {
         debug_assert!(start < end);
-        let len = self.blocks().len();
+        let len = self.blocks.len();
         if len == 0 {
             self.offset = start;
-            self.bits = FixedBitSet::with_capacity((end - start) * BLOCK_BITS);
+            self.blocks.resize(end - start, 0);
             return;
         }
-        let old_end = self.offset + len;
-        if start < self.offset {
-            // Grow at the front (and maybe the back): copy the existing blocks into a new buffer.
-            let new_end = end.max(old_end);
-            let mut bits = FixedBitSet::with_capacity((new_end - start) * BLOCK_BITS);
-            let shift = self.offset - start;
-            bits.as_mut_slice()[shift..shift + len].copy_from_slice(self.blocks());
-            self.offset = start;
-            self.bits = bits;
-        } else if end > old_end {
-            // Grow at the back. `FixedBitSet::grow` reserves the memory with amortized growth.
-            self.bits.grow((end - self.offset) * BLOCK_BITS);
+        let new_start = start.min(self.offset);
+        let new_end = end.max(self.offset + len);
+        let shift = self.offset - new_start;
+        self.blocks.resize(new_end - new_start, 0);
+        if shift > 0 {
+            // Grow at the front: move the existing blocks up and clear the blocks before them.
+            self.blocks.copy_within(..len, shift);
+            self.blocks[..shift].fill(0);
+            self.offset = new_start;
         }
     }
 
@@ -99,8 +98,11 @@ impl OffsetBitset {
         if block < self.offset || block >= self.end() {
             self.ensure_blocks(block, block + 1);
         }
-        let index = bit - self.offset * BLOCK_BITS;
-        !self.bits.put(index)
+        let mask = 1 << (bit % BLOCK_BITS);
+        let block = &mut self.blocks[block - self.offset];
+        let added = *block & mask == 0;
+        *block |= mask;
+        added
     }
 
     /// Returns whether `bit` is in the set.
@@ -110,16 +112,19 @@ impl OffsetBitset {
         if block < self.offset || block >= self.end() {
             return false;
         }
-        self.bits.contains(bit - self.offset * BLOCK_BITS)
+        self.blocks[block - self.offset] & (1 << (bit % BLOCK_BITS)) != 0
     }
 
     /// Returns whether the set has no bits.
-    pub fn is_empty(&self) -> bool {
+    pub fn is_zero(&self) -> bool {
         self.blocks().iter().all(|&b| b == 0)
     }
 
     /// Returns the number of bits in the set.
-    pub fn len(&self) -> usize {
+    ///
+    /// This counts the bits of every stored block, so it takes time proportional to the stored
+    /// range.
+    pub fn count_ones(&self) -> usize {
         self.blocks().iter().map(|b| b.count_ones() as usize).sum()
     }
 
@@ -143,7 +148,7 @@ impl OffsetBitset {
             self.ensure_blocks(other_offset, other_end);
         }
         let start = other_offset - self.offset;
-        for (block, &other_block) in self.bits.as_mut_slice()[start..start + other_blocks.len()]
+        for (block, &other_block) in self.blocks[start..start + other_blocks.len()]
             .iter_mut()
             .zip(other_blocks)
         {
@@ -294,9 +299,9 @@ impl Extend<u32> for OffsetBitset {
             end = end.max(self.end());
         }
         self.ensure_blocks(start, end);
-        let first_bit = self.offset * BLOCK_BITS;
         for bit in bits {
-            self.bits.insert(bit as usize - first_bit);
+            let bit = bit as usize;
+            self.blocks[bit / BLOCK_BITS - self.offset] |= 1 << (bit % BLOCK_BITS);
         }
     }
 }

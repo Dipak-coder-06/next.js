@@ -1,5 +1,5 @@
-//! Compares [`OffsetBitset`] with [`RoaringBitmap`] on the operations that the module graph
-//! algorithms use, over a range of bit densities.
+//! Compares [`OffsetBitset`] with [`FixedBitSet`] and [`RoaringBitmap`] on the operations that the
+//! module graph algorithms use, over a range of bit densities.
 //!
 //! Every benchmark id is `<impl>/<pattern>-<universe>-<density>`:
 //! - `universe` is the size of the bit range the set is drawn from (e.g. the number of chunk
@@ -7,10 +7,14 @@
 //! - `density` is the fraction of that range that is set, in per mille,
 //! - `pattern` is `low` for a range starting at 0, or `high` for the same sets shifted to start at
 //!   bit 1,000,000, where `OffsetBitset` skips the empty blocks below the range.
+//!
+//! `FixedBitSet` is used as is: it stores every bit from 0 up to the highest bit, so for the `high`
+//! pattern it also stores the empty range below bit 1,000,000.
 
 use std::hint::black_box;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use fixedbitset::FixedBitSet;
 use roaring::RoaringBitmap;
 use turbo_bitset::OffsetBitset;
 
@@ -100,199 +104,355 @@ fn offset(bits: &[u32]) -> OffsetBitset {
     bits.iter().copied().collect()
 }
 
+fn fixed(bits: &[u32]) -> FixedBitSet {
+    let len = bits.iter().max().map_or(0, |&max| max as usize + 1);
+    let mut set = FixedBitSet::with_capacity(len);
+    for &bit in bits {
+        set.insert(bit as usize);
+    }
+    set
+}
+
 fn roaring(bits: &[u32]) -> RoaringBitmap {
     bits.iter().copied().collect()
 }
 
-/// Benchmarks the `run_*` closures on both implementations for every input. The `setup_*`
-/// closures build the per-input state from the input, outside of the measurement.
-fn bench_both<O, R>(
+/// The setup and the measured operation of one implementation in [`bench_all`].
+struct Impl<Setup, Run> {
+    /// Builds the per-input state from the input, outside of the measurement.
+    setup: Setup,
+    /// The measured operation.
+    run: Run,
+}
+
+/// Creates an [`Impl`]. (A function instead of a struct literal so that the closure argument
+/// types are inferred.)
+fn imp<S>(
+    setup: impl Fn(&Input) -> S,
+    run: impl Fn(&S),
+) -> Impl<impl Fn(&Input) -> S, impl Fn(&S)> {
+    Impl { setup, run }
+}
+
+/// Benchmarks the three implementations on every input.
+fn bench_all<O, F, R>(
     c: &mut Criterion,
     name: &str,
     inputs: &[Input],
-    setup_offset: impl Fn(&Input) -> O,
-    run_offset: impl Fn(&O),
-    setup_roaring: impl Fn(&Input) -> R,
-    run_roaring: impl Fn(&R),
+    offset: Impl<impl Fn(&Input) -> O, impl Fn(&O)>,
+    fixed: Impl<impl Fn(&Input) -> F, impl Fn(&F)>,
+    roaring: Impl<impl Fn(&Input) -> R, impl Fn(&R)>,
 ) {
     let mut group = c.benchmark_group(format!("bitset/{name}"));
     for input in inputs {
-        let state = setup_offset(input);
+        let state = (offset.setup)(input);
         group.bench_function(BenchmarkId::new("OffsetBitset", &input.name), |b| {
-            b.iter(|| run_offset(black_box(&state)))
+            b.iter(|| (offset.run)(black_box(&state)))
         });
-        let state = setup_roaring(input);
+        let state = (fixed.setup)(input);
+        group.bench_function(BenchmarkId::new("FixedBitSet", &input.name), |b| {
+            b.iter(|| (fixed.run)(black_box(&state)))
+        });
+        let state = (roaring.setup)(input);
         group.bench_function(BenchmarkId::new("RoaringBitmap", &input.name), |b| {
-            b.iter(|| run_roaring(black_box(&state)))
+            b.iter(|| (roaring.run)(black_box(&state)))
         });
     }
     group.finish();
 }
 
+/// Checks outside of any measurement that the implementations agree on the inputs.
+fn validate(inputs: &[Input]) {
+    let as_usize = |bits: &[u32]| bits.iter().map(|&b| b as usize).collect::<Vec<_>>();
+    for input in inputs {
+        let a = fixed(&input.bits);
+        assert_eq!(a.ones().collect::<Vec<_>>(), as_usize(&input.bits));
+        assert_eq!(
+            input
+                .bits
+                .iter()
+                .map(|&b| b as usize)
+                .collect::<FixedBitSet>(),
+            a
+        );
+        let mut inserted = FixedBitSet::new();
+        for &bit in &shuffled(&input.bits) {
+            inserted.grow_and_insert(bit as usize);
+        }
+        assert_eq!(inserted.ones().collect::<Vec<_>>(), as_usize(&input.bits));
+        assert_eq!(a.count_ones(..), offset(&input.bits).count_ones());
+
+        let mut union = a.clone();
+        union.union_with(&fixed(&input.other_bits));
+        let mut offset_union = offset(&input.bits);
+        offset_union |= &offset(&input.other_bits);
+        assert_eq!(
+            union.ones().collect::<Vec<_>>(),
+            offset_union.iter().map(|b| b as usize).collect::<Vec<_>>()
+        );
+
+        for (other, superset, proper) in [
+            (&input.subset_bits, true, true),
+            (&input.not_subset_bits, false, false),
+            (&input.bits, true, false),
+        ] {
+            let b = fixed(other);
+            assert_eq!(a.is_superset(&b), superset);
+            assert_eq!(
+                a.is_superset(&b) && a.count_ones(..) != b.count_ones(..),
+                proper
+            );
+            assert_eq!(offset(&input.bits).is_superset(&offset(other)), superset);
+            assert_eq!(
+                offset(&input.bits).is_proper_superset(&offset(other)),
+                proper
+            );
+            let (ra, rb) = (roaring(&input.bits), roaring(other));
+            assert_eq!(ra.is_superset(&rb), superset);
+            assert_eq!(ra.is_superset(&rb) && ra.len() != rb.len(), proper);
+        }
+    }
+}
+
 pub fn bench(c: &mut Criterion) {
     let inputs = inputs();
+    validate(&inputs);
 
     // Building a set by inserting its bits one by one (in a fixed random order).
-    bench_both(
+    bench_all(
         c,
         "insert",
         &inputs,
-        |i| shuffled(&i.bits),
-        |bits| {
-            let mut set = OffsetBitset::new();
-            for &bit in bits {
-                black_box(set.insert(bit));
-            }
-            black_box(set);
-        },
-        |i| shuffled(&i.bits),
-        |bits| {
-            let mut set = RoaringBitmap::new();
-            for &bit in bits {
-                black_box(set.insert(bit));
-            }
-            black_box(set);
-        },
+        imp(
+            |i| shuffled(&i.bits),
+            |bits| {
+                let mut set = OffsetBitset::new();
+                for &bit in bits {
+                    black_box(set.insert(bit));
+                }
+                black_box(set);
+            },
+        ),
+        imp(
+            |i| shuffled(&i.bits),
+            |bits| {
+                let mut set = FixedBitSet::new();
+                for &bit in bits {
+                    let bit = bit as usize;
+                    let added = !set.contains(bit);
+                    set.grow_and_insert(bit);
+                    black_box(added);
+                }
+                black_box(set);
+            },
+        ),
+        imp(
+            |i| shuffled(&i.bits),
+            |bits| {
+                let mut set = RoaringBitmap::new();
+                for &bit in bits {
+                    black_box(set.insert(bit));
+                }
+                black_box(set);
+            },
+        ),
     );
 
     // Building a set from an ascending iterator.
-    bench_both(
+    bench_all(
         c,
         "from_iter",
         &inputs,
-        |i| i.bits.clone(),
-        |bits| {
-            black_box(bits.iter().copied().collect::<OffsetBitset>());
-        },
-        |i| i.bits.clone(),
-        |bits| {
-            black_box(bits.iter().copied().collect::<RoaringBitmap>());
-        },
+        imp(
+            |i| i.bits.clone(),
+            |bits| {
+                black_box(bits.iter().copied().collect::<OffsetBitset>());
+            },
+        ),
+        imp(
+            |i| i.bits.clone(),
+            |bits| {
+                black_box(bits.iter().map(|&b| b as usize).collect::<FixedBitSet>());
+            },
+        ),
+        imp(
+            |i| i.bits.clone(),
+            |bits| {
+                black_box(bits.iter().copied().collect::<RoaringBitmap>());
+            },
+        ),
     );
 
-    bench_both(
+    bench_all(
         c,
         "contains",
         &inputs,
-        |i| (offset(&i.bits), i.probes.clone()),
-        |(set, probes)| {
-            for &bit in probes {
-                black_box(set.contains(bit));
-            }
-        },
-        |i| (roaring(&i.bits), i.probes.clone()),
-        |(set, probes)| {
-            for &bit in probes {
-                black_box(set.contains(bit));
-            }
-        },
+        imp(
+            |i| (offset(&i.bits), i.probes.clone()),
+            |(set, probes)| {
+                for &bit in probes {
+                    black_box(set.contains(bit));
+                }
+            },
+        ),
+        imp(
+            |i| (fixed(&i.bits), i.probes.clone()),
+            |(set, probes)| {
+                for &bit in probes {
+                    black_box(set.contains(bit as usize));
+                }
+            },
+        ),
+        imp(
+            |i| (roaring(&i.bits), i.probes.clone()),
+            |(set, probes)| {
+                for &bit in probes {
+                    black_box(set.contains(bit));
+                }
+            },
+        ),
     );
 
-    bench_both(
+    bench_all(
         c,
         "iter",
         &inputs,
-        |i| offset(&i.bits),
-        |set| {
-            black_box(set.iter().fold(0u32, u32::wrapping_add));
-        },
-        |i| roaring(&i.bits),
-        |set| {
-            black_box(set.iter().fold(0u32, u32::wrapping_add));
-        },
+        imp(
+            |i| offset(&i.bits),
+            |set| {
+                black_box(set.iter().fold(0u32, u32::wrapping_add));
+            },
+        ),
+        imp(
+            |i| fixed(&i.bits),
+            |set| {
+                black_box(
+                    set.ones()
+                        .fold(0u32, |sum, bit| sum.wrapping_add(bit as u32)),
+                );
+            },
+        ),
+        imp(
+            |i| roaring(&i.bits),
+            |set| {
+                black_box(set.iter().fold(0u32, u32::wrapping_add));
+            },
+        ),
     );
 
-    bench_both(
+    bench_all(
         c,
-        "len",
+        "count_ones",
         &inputs,
-        |i| offset(&i.bits),
-        |set| {
-            black_box(set.len());
-        },
-        |i| roaring(&i.bits),
-        |set| {
-            black_box(set.len());
-        },
+        imp(
+            |i| offset(&i.bits),
+            |set| {
+                black_box(set.count_ones());
+            },
+        ),
+        imp(
+            |i| fixed(&i.bits),
+            |set| {
+                black_box(set.count_ones(..));
+            },
+        ),
+        imp(
+            |i| roaring(&i.bits),
+            |set| {
+                black_box(set.len());
+            },
+        ),
     );
 
-    bench_both(
+    bench_all(
         c,
         "clone",
         &inputs,
-        |i| offset(&i.bits),
-        |set| {
-            black_box(set.clone());
-        },
-        |i| roaring(&i.bits),
-        |set| {
-            black_box(set.clone());
-        },
+        imp(
+            |i| offset(&i.bits),
+            |set| {
+                black_box(set.clone());
+            },
+        ),
+        imp(
+            |i| fixed(&i.bits),
+            |set| {
+                black_box(set.clone());
+            },
+        ),
+        imp(
+            |i| roaring(&i.bits),
+            |set| {
+                black_box(set.clone());
+            },
+        ),
     );
 
-    // `a ⊇ b` where it holds, and where it fails because of the highest bit of `b`.
-    for (name, subset, expected) in [
+    // `a ⊇ b` where it holds, and where it fails because of the highest bit of `b`. The outcomes
+    // are checked in `validate`.
+    for (name, subset) in [
         (
             "superset_true",
             (|i: &Input| &i.subset_bits) as fn(&Input) -> &Vec<u32>,
-            true,
         ),
-        ("superset_false", |i: &Input| &i.not_subset_bits, false),
+        ("superset_false", |i: &Input| &i.not_subset_bits),
     ] {
-        for input in &inputs {
-            assert_eq!(
-                offset(&input.bits).is_superset(&offset(subset(input))),
-                expected
-            );
-            assert_eq!(
-                roaring(&input.bits).is_superset(&roaring(subset(input))),
-                expected
-            );
-        }
-        bench_both(
+        bench_all(
             c,
             name,
             &inputs,
-            |i| (offset(&i.bits), offset(subset(i))),
-            |(a, b)| {
-                black_box(a.is_superset(b));
-            },
-            |i| (roaring(&i.bits), roaring(subset(i))),
-            |(a, b)| {
-                black_box(a.is_superset(b));
-            },
+            imp(
+                |i| (offset(&i.bits), offset(subset(i))),
+                |(a, b)| {
+                    black_box(a.is_superset(b));
+                },
+            ),
+            imp(
+                |i| (fixed(&i.bits), fixed(subset(i))),
+                |(a, b)| {
+                    black_box(a.is_superset(b));
+                },
+            ),
+            imp(
+                |i| (roaring(&i.bits), roaring(subset(i))),
+                |(a, b)| {
+                    black_box(a.is_superset(b));
+                },
+            ),
         );
     }
 
-    // `a ⊋ b`, for a proper superset, and for equal sets (where it fails).
-    for (name, other, expected) in [
+    // `a ⊋ b`, for a proper superset, and for equal sets (where it fails). The outcomes are
+    // checked in `validate`.
+    for (name, other) in [
         (
             "proper_superset_true",
             (|i: &Input| &i.subset_bits) as fn(&Input) -> &Vec<u32>,
-            true,
         ),
-        ("proper_superset_false", |i: &Input| &i.bits, false),
+        ("proper_superset_false", |i: &Input| &i.bits),
     ] {
-        for input in &inputs {
-            assert_eq!(
-                offset(&input.bits).is_proper_superset(&offset(other(input))),
-                expected
-            );
-            let (a, b) = (roaring(&input.bits), roaring(other(input)));
-            assert_eq!(a.is_superset(&b) && a.len() != b.len(), expected);
-        }
-        bench_both(
+        bench_all(
             c,
             name,
             &inputs,
-            |i| (offset(&i.bits), offset(other(i))),
-            |(a, b)| {
-                black_box(a.is_proper_superset(b));
-            },
-            |i| (roaring(&i.bits), roaring(other(i))),
-            |(a, b)| {
-                black_box(a.is_superset(b) && a.len() != b.len());
-            },
+            imp(
+                |i| (offset(&i.bits), offset(other(i))),
+                |(a, b)| {
+                    black_box(a.is_proper_superset(b));
+                },
+            ),
+            imp(
+                |i| (fixed(&i.bits), fixed(other(i))),
+                |(a, b)| {
+                    black_box(a.is_superset(b) && a.count_ones(..) != b.count_ones(..));
+                },
+            ),
+            imp(
+                |i| (roaring(&i.bits), roaring(other(i))),
+                |(a, b)| {
+                    black_box(a.is_superset(b) && a.len() != b.len());
+                },
+            ),
         );
     }
 
@@ -306,6 +466,17 @@ pub fn bench(c: &mut Criterion) {
                 || a.clone(),
                 |a| {
                     *a |= black_box(&b);
+                    black_box(&*a);
+                },
+                BatchSize::SmallInput,
+            )
+        });
+        let (a, b) = (fixed(&input.bits), fixed(&input.other_bits));
+        group.bench_function(BenchmarkId::new("FixedBitSet", &input.name), |bencher| {
+            bencher.iter_batched_ref(
+                || a.clone(),
+                |a| {
+                    a.union_with(black_box(&b));
                     black_box(&*a);
                 },
                 BatchSize::SmallInput,

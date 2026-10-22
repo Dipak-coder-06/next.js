@@ -750,7 +750,7 @@ pub async fn compute_chunk_group_info(graph: &ModuleGraph) -> Result<Vc<ChunkGro
                                 bail!("Module chunk groups not found");
                             };
 
-                            if current_chunk_groups.is_empty() {
+                            if current_chunk_groups.is_zero() {
                                 // Initial visit, clone instead of merging
                                 *current_chunk_groups = parent_chunk_groups.clone();
                                 GraphTraversalAction::Continue
@@ -795,7 +795,7 @@ pub async fn compute_chunk_group_info(graph: &ModuleGraph) -> Result<Vc<ChunkGro
 
             let mut buckets = BTreeMap::default();
             for (module, key) in &module_chunk_groups {
-                if !key.is_empty() {
+                if !key.is_zero() {
                     buckets
                         .entry(key.iter().collect::<Vec<_>>())
                         .or_insert(BTreeSet::new())
