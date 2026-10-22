@@ -9066,6 +9066,7 @@ dependencies = [
 name = "turbo-bitset"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "codspeed-criterion-compat",
  "fixedbitset",
  "roaring",
