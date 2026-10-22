@@ -20,6 +20,14 @@ use roaring::RoaringBitmap;
 /// Number of bits per storage block.
 const BLOCK_BITS: usize = usize::BITS as usize;
 
+/// The number of blocks that the subset check compares before it branches on the result. Reducing
+/// a whole chunk first lets the compiler vectorize the comparison.
+const CHUNK_BLOCKS: usize = 4;
+
+/// Up to this many bits, [`OffsetBitset::extend`] buffers the bits on the stack instead of in a
+/// `Vec` while it determines their range.
+const EXTEND_STACK_BITS: usize = 16;
+
 /// A set of `u32` indices stored as `usize` blocks that only cover the block-aligned range between
 /// the lowest and the highest stored bit.
 ///
@@ -67,10 +75,22 @@ impl OffsetBitset {
         (self.offset + first, &blocks[first..=last])
     }
 
+    /// The position of `block` in the stored blocks, if it is stored.
+    ///
+    /// A block below the offset wraps around to a huge position, so a single comparison against
+    /// the length checks both ends of the range.
+    #[inline]
+    fn position(&self, block: usize) -> Option<usize> {
+        let position = block.wrapping_sub(self.offset);
+        (position < self.blocks.len()).then_some(position)
+    }
+
     /// Makes sure that the blocks `start..end` are stored, keeping all existing bits.
     ///
     /// This reuses the spare capacity of the storage when the new range fits into it, also when
-    /// growing at the front. Otherwise it reallocates with amortized growth.
+    /// growing at the front. Otherwise it reallocates with amortized growth and copies the existing
+    /// blocks once, directly to their new position.
+    #[cold]
     fn ensure_blocks(&mut self, start: usize, end: usize) {
         debug_assert!(start < end);
         let len = self.blocks.len();
@@ -81,25 +101,44 @@ impl OffsetBitset {
         }
         let new_start = start.min(self.offset);
         let new_end = end.max(self.offset + len);
+        let new_len = new_end - new_start;
         let shift = self.offset - new_start;
-        self.blocks.resize(new_end - new_start, 0);
-        if shift > 0 {
-            // Grow at the front: move the existing blocks up and clear the blocks before them.
+        if shift == 0 {
+            // Only grow at the back.
+            self.blocks.resize(new_len, 0);
+            return;
+        }
+        if new_len <= self.blocks.capacity() {
+            // Grow at the front within the capacity: move the existing blocks up and clear the
+            // blocks before them.
+            self.blocks.resize(new_len, 0);
             self.blocks.copy_within(..len, shift);
             self.blocks[..shift].fill(0);
-            self.offset = new_start;
+        } else {
+            // Reallocate (with the same amortized growth as `Vec::reserve`), copying the existing
+            // blocks once.
+            let mut blocks = Vec::with_capacity(new_len.max(self.blocks.capacity() * 2));
+            blocks.resize(shift, 0);
+            blocks.extend_from_slice(&self.blocks);
+            blocks.resize(new_len, 0);
+            self.blocks = blocks;
         }
+        self.offset = new_start;
     }
 
     /// Adds `bit` to the set. Returns whether it wasn't in the set before.
     pub fn insert(&mut self, bit: u32) -> bool {
         let bit = bit as usize;
         let block = bit / BLOCK_BITS;
-        if block < self.offset || block >= self.end() {
-            self.ensure_blocks(block, block + 1);
-        }
+        let position = match self.position(block) {
+            Some(position) => position,
+            None => {
+                self.ensure_blocks(block, block + 1);
+                block - self.offset
+            }
+        };
         let mask = 1 << (bit % BLOCK_BITS);
-        let block = &mut self.blocks[block - self.offset];
+        let block = &mut self.blocks[position];
         let added = *block & mask == 0;
         *block |= mask;
         added
@@ -108,11 +147,10 @@ impl OffsetBitset {
     /// Returns whether `bit` is in the set.
     pub fn contains(&self, bit: u32) -> bool {
         let bit = bit as usize;
-        let block = bit / BLOCK_BITS;
-        if block < self.offset || block >= self.end() {
-            return false;
+        match self.position(bit / BLOCK_BITS) {
+            Some(position) => self.blocks[position] & (1 << (bit % BLOCK_BITS)) != 0,
+            None => false,
         }
-        self.blocks[block - self.offset] & (1 << (bit % BLOCK_BITS)) != 0
     }
 
     /// Returns whether the set has no bits.
@@ -139,6 +177,16 @@ impl OffsetBitset {
 
     /// Adds all bits of `other` to the set.
     pub fn union_with(&mut self, other: &Self) {
+        if other.offset >= self.offset && other.end() <= self.end() {
+            // The stored range of `other` lies within the set's range, so its blocks can be added
+            // without trimming or growing.
+            let start = other.offset - self.offset;
+            or_blocks(
+                &mut self.blocks[start..start + other.blocks.len()],
+                &other.blocks,
+            );
+            return;
+        }
         let (other_offset, other_blocks) = other.trimmed();
         if other_blocks.is_empty() {
             return;
@@ -148,12 +196,10 @@ impl OffsetBitset {
             self.ensure_blocks(other_offset, other_end);
         }
         let start = other_offset - self.offset;
-        for (block, &other_block) in self.blocks[start..start + other_blocks.len()]
-            .iter_mut()
-            .zip(other_blocks)
-        {
-            *block |= other_block;
-        }
+        or_blocks(
+            &mut self.blocks[start..start + other_blocks.len()],
+            other_blocks,
+        );
     }
 
     /// Compares the set with `other`. Returns whether the set contains every bit of `other`
@@ -184,18 +230,35 @@ impl OffsetBitset {
 
         let self_start = start - self.offset;
         let self_end = end - self.offset;
-        let mut strict = false;
-        for (&a, &b) in blocks[self_start..self_end]
-            .iter()
-            .zip(&other_blocks[other_start..other_end])
-        {
-            if b & !a != 0 {
+        let a = &blocks[self_start..self_end];
+        let b = &other_blocks[other_start..other_end];
+        // Reduce whole chunks before branching so that the compiler can vectorize the loop.
+        let mut strict_bits = 0;
+        let (a_chunks, a_rest) = a.as_chunks::<CHUNK_BLOCKS>();
+        let (b_chunks, b_rest) = b.as_chunks::<CHUNK_BLOCKS>();
+        for (a, b) in a_chunks.iter().zip(b_chunks) {
+            let mut missing = 0;
+            for i in 0..CHUNK_BLOCKS {
+                missing |= b[i] & !a[i];
+                if STRICT {
+                    strict_bits |= a[i] & !b[i];
+                }
+            }
+            if missing != 0 {
                 return (false, false);
             }
+        }
+        let mut missing = 0;
+        for (&a, &b) in a_rest.iter().zip(b_rest) {
+            missing |= b & !a;
             if STRICT {
-                strict |= a & !b != 0;
+                strict_bits |= a & !b;
             }
         }
+        if missing != 0 {
+            return (false, false);
+        }
+        let mut strict = strict_bits != 0;
         if STRICT && !strict {
             strict = any(&blocks[..self_start]) || any(&blocks[self_end..]);
         }
@@ -285,24 +348,55 @@ impl BitOrAssign<&OffsetBitset> for OffsetBitset {
     }
 }
 
-impl Extend<u32> for OffsetBitset {
-    fn extend<T: IntoIterator<Item = u32>>(&mut self, iter: T) {
-        let bits = iter.into_iter().collect::<Vec<_>>();
+impl OffsetBitset {
+    /// Adds `bits` to the set, allocating the whole range they need at once instead of growing for
+    /// every bit.
+    fn extend_from_slice(&mut self, bits: &[u32]) {
         let (Some(&min), Some(&max)) = (bits.iter().min(), bits.iter().max()) else {
             return;
         };
-        // Allocate the whole range once instead of growing for every bit.
-        let mut start = min as usize / BLOCK_BITS;
-        let mut end = max as usize / BLOCK_BITS + 1;
-        if !self.blocks().is_empty() {
-            start = start.min(self.offset);
-            end = end.max(self.end());
+        let start = min as usize / BLOCK_BITS;
+        let end = max as usize / BLOCK_BITS + 1;
+        if start < self.offset || end > self.end() {
+            self.ensure_blocks(start, end);
         }
-        self.ensure_blocks(start, end);
-        for bit in bits {
+        for &bit in bits {
             let bit = bit as usize;
             self.blocks[bit / BLOCK_BITS - self.offset] |= 1 << (bit % BLOCK_BITS);
         }
+    }
+}
+
+/// Adds the bits of `other` to `blocks`, which has the same length.
+#[inline]
+fn or_blocks(blocks: &mut [usize], other: &[usize]) {
+    for (block, &other_block) in blocks.iter_mut().zip(other) {
+        *block |= other_block;
+    }
+}
+
+impl Extend<u32> for OffsetBitset {
+    fn extend<T: IntoIterator<Item = u32>>(&mut self, iter: T) {
+        // Buffer the first bits on the stack, so that small inputs don't need a temporary `Vec` to
+        // determine their range.
+        let mut iter = iter.into_iter();
+        let mut buffer = [0; EXTEND_STACK_BITS];
+        let mut len = 0;
+        for bit in iter.by_ref() {
+            buffer[len] = bit;
+            len += 1;
+            if len == EXTEND_STACK_BITS {
+                break;
+            }
+        }
+        if len < EXTEND_STACK_BITS {
+            self.extend_from_slice(&buffer[..len]);
+            return;
+        }
+        let mut bits = Vec::with_capacity(EXTEND_STACK_BITS + iter.size_hint().0);
+        bits.extend_from_slice(&buffer);
+        bits.extend(iter);
+        self.extend_from_slice(&bits);
     }
 }
 

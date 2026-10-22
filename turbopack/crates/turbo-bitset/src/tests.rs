@@ -57,6 +57,24 @@ fn from_bits(bits: &[u32]) -> (OffsetBitset, BTreeSet<u32>) {
     )
 }
 
+/// A set storing the given block range, including leading or trailing zero blocks.
+fn with_storage(offset: usize, blocks: Vec<usize>) -> OffsetBitset {
+    OffsetBitset { offset, blocks }
+}
+
+/// The bits of a block range, starting at block `offset`.
+fn bits_of(offset: usize, blocks: &[usize]) -> BTreeSet<u32> {
+    blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(index, &block)| {
+            (0..usize::BITS as usize)
+                .filter(move |bit| block & (1 << bit) != 0)
+                .map(move |bit| ((offset + index) * usize::BITS as usize + bit) as u32)
+        })
+        .collect()
+}
+
 #[test]
 fn empty() {
     let set = OffsetBitset::new();
@@ -312,6 +330,158 @@ fn extend() {
     let mut set = OffsetBitset::new();
     set.extend([900, 3, 70_000, 3]);
     check(&set, &[3, 900, 70_000].into());
+}
+
+#[test]
+fn extend_around_the_stack_buffer_size() {
+    // `extend` buffers up to `EXTEND_STACK_BITS` bits on the stack and spills into a `Vec` after
+    // that. Check both paths, the boundary, and extending a set that already has bits below and
+    // above the new ones.
+    let block = usize::BITS;
+    for len in [
+        0,
+        1,
+        crate::EXTEND_STACK_BITS - 1,
+        crate::EXTEND_STACK_BITS,
+        crate::EXTEND_STACK_BITS + 1,
+        3 * crate::EXTEND_STACK_BITS,
+    ] {
+        let bits = (0..len as u32)
+            .map(|i| 10 * block + i * 37 % (5 * block))
+            .collect::<Vec<_>>();
+        let (set, expected) = from_bits(&bits);
+        check(&set, &expected);
+
+        let mut set = [block, 30 * block].into_iter().collect::<OffsetBitset>();
+        let mut expected = set.iter().collect::<BTreeSet<_>>();
+        set.extend(bits.iter().copied());
+        expected.extend(bits.iter().copied());
+        check(&set, &expected);
+
+        // An iterator that hides its length.
+        let mut set = OffsetBitset::new();
+        set.extend(bits.iter().copied().filter(|_| true));
+        check(&set, &bits.iter().copied().collect());
+    }
+}
+
+#[test]
+fn front_growth_beyond_the_capacity_keeps_all_bits() {
+    // Growing at the front when the capacity doesn't suffice allocates a new buffer; the existing
+    // blocks must end up at their shifted position, with zeros before and after them.
+    let block = usize::BITS;
+    for (existing, new) in [
+        (&[50 * block, 52 * block + 3][..], 40 * block + 1),
+        (&[50 * block + block - 1][..], 0),
+        (
+            &[50 * block, 51 * block - 1, 60 * block][..],
+            50 * block - 1,
+        ),
+    ] {
+        let mut set = OffsetBitset::new();
+        let mut expected = BTreeSet::new();
+        for &bit in existing {
+            set.insert(bit);
+            expected.insert(bit);
+        }
+        set.blocks = set.blocks.into_boxed_slice().into_vec();
+        let capacity = set.blocks.capacity();
+        assert_eq!(capacity, set.blocks.len());
+        assert!(set.insert(new));
+        expected.insert(new);
+        check(&set, &expected);
+        assert!(set.blocks.capacity() > capacity);
+    }
+}
+
+#[test]
+fn superset_chunk_boundaries() {
+    // The subset check compares chunks of `CHUNK_BLOCKS` blocks and then the remaining blocks.
+    // Place a missing bit in every block of overlaps of different lengths, with zero-padding
+    // that makes the stored ranges and chunk alignment differ.
+    let chunk = crate::CHUNK_BLOCKS;
+    for len in [1, chunk - 1, chunk, chunk + 1, 2 * chunk, 3 * chunk + 2] {
+        for a_padding in [0, 1, chunk] {
+            for b_padding in [0, 1, chunk + 1] {
+                let offset = 10 + chunk;
+                let a_blocks = vec![usize::MAX / 3; len];
+                let mut a_storage = vec![0; a_padding];
+                a_storage.extend_from_slice(&a_blocks);
+                let a = with_storage(offset - a_padding, a_storage);
+
+                let b_blocks = a_blocks
+                    .iter()
+                    .map(|&block| block & !(1 << 4))
+                    .collect::<Vec<_>>();
+                let mut b_storage = vec![0; b_padding];
+                b_storage.extend_from_slice(&b_blocks);
+                b_storage.extend(std::iter::repeat_n(0, b_padding));
+                let b = with_storage(offset - b_padding, b_storage);
+
+                assert!(a.is_superset(&b));
+                assert!(a.is_proper_superset(&b));
+                assert!(b.is_subset(&a));
+                assert!(!a.is_subset(&b));
+                assert!(a.is_superset(&a));
+                assert!(!a.is_proper_superset(&a));
+                for index in 0..len {
+                    let mut missing_blocks = b_blocks.clone();
+                    missing_blocks[index] |= 1 << 1;
+                    let mut storage = vec![0; b_padding];
+                    storage.extend_from_slice(&missing_blocks);
+                    storage.extend(std::iter::repeat_n(0, b_padding));
+                    let c = with_storage(offset - b_padding, storage);
+                    assert!(!a.is_superset(&c), "missing bit in block {index} of {len}");
+                    assert!(!a.is_proper_superset(&c));
+                    assert!(!c.is_subset(&a));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn superset_differential_over_chunk_lengths() {
+    // Every overlap length up to 20 blocks, with zero-padded storage and subset, equal and
+    // incomparable operands.
+    let mut rng = Lcg(11);
+    let mut random_block = || ((u64::from(rng.next()) << 32) | u64::from(rng.next())) as usize;
+    for len in 0..=20 {
+        for padding in [0, 1, crate::CHUNK_BLOCKS] {
+            for case in 0..6 {
+                let a_blocks = (0..len).map(|_| random_block()).collect::<Vec<_>>();
+                let b_blocks = a_blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &block)| match case {
+                        0 => block,
+                        1 => block & random_block(),
+                        2 if index == len / 2 => block | 1,
+                        3 => random_block(),
+                        4 => 0,
+                        _ => block & !(1 << (index % usize::BITS as usize)),
+                    })
+                    .collect::<Vec<_>>();
+                let offset = 30;
+                let mut a_storage = vec![0; padding];
+                a_storage.extend_from_slice(&a_blocks);
+                let a = with_storage(offset - padding, a_storage);
+                let mut b_storage = b_blocks.clone();
+                b_storage.extend(std::iter::repeat_n(0, padding));
+                let b = with_storage(offset, b_storage);
+                let a_expected = bits_of(offset, &a_blocks);
+                let b_expected = bits_of(offset, &b_blocks);
+
+                assert_eq!(a.is_superset(&b), a_expected.is_superset(&b_expected));
+                assert_eq!(
+                    a.is_proper_superset(&b),
+                    a_expected.is_superset(&b_expected) && a_expected != b_expected
+                );
+                assert_eq!(a.is_subset(&b), a_expected.is_subset(&b_expected));
+                assert_eq!(b.is_subset(&a), b_expected.is_subset(&a_expected));
+            }
+        }
+    }
 }
 
 #[test]
