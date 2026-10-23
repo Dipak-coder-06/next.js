@@ -4157,7 +4157,6 @@ dependencies = [
  "itertools 0.10.5",
  "next-core",
  "regex",
- "roaring",
  "rustc-hash 2.1.1",
  "serde",
  "serde_json",
