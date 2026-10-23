@@ -9,13 +9,14 @@ edition = "2024"
 workspace = true
 
 [dependencies]
-roaring = { workspace = true }
+bincode = { workspace = true }
+shrink-to-fit = { workspace = true }
 
 [dev-dependencies]
-bincode = { workspace = true }
 criterion = { workspace = true }
 fixedbitset = { workspace = true }
-# The `sizes` example measures the serialized size of `RoaringBitmap` through serde.
+# The benchmarks, tests and the `sizes` example compare with `RoaringBitmap`, including its
+# serialization through serde.
 roaring = { workspace = true, features = ["serde"] }
 rustc-hash = { workspace = true }
 

@@ -7,11 +7,10 @@
 //!
 //! Serialized sizes are measured by actually encoding (and decoding again) with bincode's
 //! standard config, the config Turbopack persists with:
+//! - `OffsetBitset` with its own encoding (the trimmed bitmap bytes or the delta-encoded list of
+//!   bits, whichever is smaller).
 //! - `RoaringBitmap` through its serde implementation (the portable Roaring format as a
-//!   length-prefixed byte string), which is how `RoaringBitmapWrapper` is encoded.
-//! - `OffsetBitset` has no serialization. As a hypothetical encoding, its `(offset, words)` as
-//!   `(u64, Vec<u64>)`, once with bincode's standard varint integers and once with fixed-width
-//!   integers.
+//!   length-prefixed byte string), how Turbopack persisted these sets before `OffsetBitset`.
 //!
 //! Run with `cargo run --release -p turbo-bitset --example sizes`. Prints CSV.
 
@@ -122,11 +121,10 @@ fn shuffled(rng: &mut Lcg, bits: &[u32]) -> Vec<u32> {
 
 fn main() {
     let varint = bincode::config::standard();
-    let fixint = bincode::config::standard().with_fixed_int_encoding();
     println!(
         "distribution,universe,density_ppm,bits,actual_density_ppm,offset_sorted,offset_random,\
-         roaring_sorted,roaring_random,offset_words,offset_ser_fixed,offset_ser_varint,\
-         roaring_portable,roaring_ser,roaring_ser_optimized"
+         roaring_sorted,roaring_random,offset_words,offset_ser,offset_form,roaring_portable,\
+         roaring_ser,roaring_ser_optimized"
     );
     for clustered in [false, true] {
         for universe in [1_024u32, 16_384, 65_536, 1_048_576] {
@@ -155,39 +153,18 @@ fn main() {
                 });
                 assert_eq!(offset_sorted, offset_random);
                 assert_eq!(roaring_sorted, roaring_random);
-                assert_eq!(offset_sorted.to_roaring(), roaring_sorted);
+                assert!(offset_sorted.iter().eq(roaring_sorted.iter()));
 
                 // The block-aligned word range of the set: from the lowest to the highest word.
-                let first_word = (bits[0] / 64) as u64;
-                let last_word = (*bits.last().unwrap() / 64) as u64;
-                let words = (last_word - first_word + 1) as usize;
-                let mut word_values = vec![0u64; words];
-                for &bit in &bits {
-                    word_values[(bit as u64 / 64 - first_word) as usize] |= 1 << (bit % 64);
-                }
-                let encoded: (u64, Vec<u64>) = (first_word, word_values);
-                let offset_varint = bincode::encode_to_vec(&encoded, varint).unwrap();
-                let offset_fixint = bincode::encode_to_vec(&encoded, fixint).unwrap();
-                for (bytes, config) in [(&offset_varint, false), (&offset_fixint, true)] {
-                    let decoded: (u64, Vec<u64>) = if config {
-                        bincode::decode_from_slice(bytes, fixint).unwrap().0
-                    } else {
-                        bincode::decode_from_slice(bytes, varint).unwrap().0
-                    };
-                    assert_eq!(decoded, encoded);
-                    let decoded_bits = decoded
-                        .1
-                        .iter()
-                        .enumerate()
-                        .flat_map(|(index, &word)| {
-                            (0..64)
-                                .filter(move |bit| word & (1 << bit) != 0)
-                                .map(move |bit| ((decoded.0 + index as u64) * 64 + bit) as u32)
-                        })
-                        .collect::<OffsetBitset>();
-                    assert_eq!(decoded_bits, offset_sorted);
-                }
-                assert_eq!(offset_fixint.len(), 16 + 8 * words);
+                let words = (*bits.last().unwrap() / 64 - bits[0] / 64 + 1) as usize;
+                let offset_ser = bincode::encode_to_vec(&offset_sorted, varint).unwrap();
+                let decoded: OffsetBitset =
+                    bincode::decode_from_slice(&offset_ser, varint).unwrap().0;
+                assert_eq!(decoded, offset_sorted);
+                // The sign of the decoded header tells the form.
+                let (header, _): (i64, _) =
+                    bincode::decode_from_slice(&offset_ser, varint).unwrap();
+                let offset_form = if header < 0 { "list" } else { "bitmap" };
 
                 // The portable Roaring format, and the same through bincode's serde support.
                 let mut portable = Vec::new();
@@ -211,12 +188,11 @@ fn main() {
                 println!(
                     "{},{universe},{per_million},{},{},{offset_sorted_bytes},\
                      {offset_random_bytes},{roaring_sorted_bytes},{roaring_random_bytes},{words},\
-                     {},{},{},{},{}",
+                     {},{offset_form},{},{},{}",
                     if clustered { "clustered" } else { "uniform" },
                     bits.len(),
                     bits.len() as u64 * 1_000_000 / universe as u64,
-                    offset_fixint.len(),
-                    offset_varint.len(),
+                    offset_ser.len(),
                     portable.len(),
                     roaring_ser.len(),
                     optimized_ser.len(),

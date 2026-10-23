@@ -10,9 +10,14 @@
 //!
 //! `FixedBitSet` is used as is: it stores every bit from 0 up to the highest bit, so for the `high`
 //! pattern it also stores the empty range below bit 1,000,000.
+//!
+//! The `serialize` and `deserialize` groups compare the bincode encoding of `OffsetBitset` with
+//! `RoaringBitmap` through its serde implementation (the portable Roaring format), both with
+//! bincode's standard config.
 
 use std::hint::black_box;
 
+use bincode::config::{Configuration, standard};
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use fixedbitset::FixedBitSet;
 use roaring::RoaringBitmap;
@@ -117,6 +122,24 @@ fn roaring(bits: &[u32]) -> RoaringBitmap {
     bits.iter().copied().collect()
 }
 
+const CONFIG: Configuration = standard();
+
+fn encode_offset(set: &OffsetBitset) -> Vec<u8> {
+    bincode::encode_to_vec(set, CONFIG).unwrap()
+}
+
+fn decode_offset(bytes: &[u8]) -> OffsetBitset {
+    bincode::decode_from_slice(bytes, CONFIG).unwrap().0
+}
+
+fn encode_roaring(set: &RoaringBitmap) -> Vec<u8> {
+    bincode::serde::encode_to_vec(set, CONFIG).unwrap()
+}
+
+fn decode_roaring(bytes: &[u8]) -> RoaringBitmap {
+    bincode::serde::decode_from_slice(bytes, CONFIG).unwrap().0
+}
+
 /// The setup and the measured operation of one implementation in [`bench_all`].
 struct Impl<Setup, Run> {
     /// Builds the per-input state from the input, outside of the measurement.
@@ -211,6 +234,33 @@ fn validate(inputs: &[Input]) {
             assert_eq!(ra.is_superset(&rb), superset);
             assert_eq!(ra.is_superset(&rb) && ra.len() != rb.len(), proper);
         }
+
+        // The binary operations agree.
+        let (oa, ob) = (offset(&input.bits), offset(&input.other_bits));
+        let (fa, fb) = (fixed(&input.bits), fixed(&input.other_bits));
+        let (ra, rb) = (roaring(&input.bits), roaring(&input.other_bits));
+        let intersection = (&ra & &rb).iter().collect::<Vec<_>>();
+        assert_eq!((&oa & &ob).iter().collect::<Vec<_>>(), intersection);
+        assert_eq!(
+            (&fa & &fb).ones().collect::<Vec<_>>(),
+            as_usize(&intersection)
+        );
+        let difference = (&ra - &rb).iter().collect::<Vec<_>>();
+        assert_eq!((&oa - &ob).iter().collect::<Vec<_>>(), difference);
+        let mut fixed_difference = fa.clone();
+        fixed_difference.difference_with(&fb);
+        assert_eq!(
+            fixed_difference.ones().collect::<Vec<_>>(),
+            as_usize(&difference)
+        );
+        assert_eq!(oa.intersection_len(&ob) as u64, ra.intersection_len(&rb));
+        assert_eq!(fa.intersection_count(&fb) as u64, ra.intersection_len(&rb));
+        assert_eq!(oa.is_disjoint(&ob), ra.is_disjoint(&rb));
+        assert_eq!(fa.is_disjoint(&fb), ra.is_disjoint(&rb));
+
+        // Both encodings round-trip.
+        assert_eq!(decode_offset(&encode_offset(&oa)), oa);
+        assert_eq!(decode_roaring(&encode_roaring(&ra)), ra);
     }
 }
 
@@ -496,12 +546,93 @@ pub fn bench(c: &mut Criterion) {
     }
     group.finish();
 
-    // Converting into a `RoaringBitmap`, the cost at the output boundary of the algorithms.
-    let mut group = c.benchmark_group("bitset/to_roaring");
+    // The operations of production chunking on two sets of the same density.
+    let pair = |i: &Input| (offset(&i.bits), offset(&i.other_bits));
+    let fixed_pair = |i: &Input| (fixed(&i.bits), fixed(&i.other_bits));
+    let roaring_pair = |i: &Input| (roaring(&i.bits), roaring(&i.other_bits));
+    bench_all(
+        c,
+        "intersection",
+        &inputs,
+        imp(pair, |(a, b)| {
+            black_box(a & b);
+        }),
+        imp(fixed_pair, |(a, b)| {
+            black_box(a & b);
+        }),
+        imp(roaring_pair, |(a, b)| {
+            black_box(a & b);
+        }),
+    );
+    bench_all(
+        c,
+        "difference",
+        &inputs,
+        imp(pair, |(a, b)| {
+            black_box(a - b);
+        }),
+        imp(fixed_pair, |(a, b)| {
+            let mut result = a.clone();
+            result.difference_with(b);
+            black_box(result);
+        }),
+        imp(roaring_pair, |(a, b)| {
+            black_box(a - b);
+        }),
+    );
+    bench_all(
+        c,
+        "intersection_len",
+        &inputs,
+        imp(pair, |(a, b)| {
+            black_box(a.intersection_len(b));
+        }),
+        imp(fixed_pair, |(a, b)| {
+            black_box(a.intersection_count(b));
+        }),
+        imp(roaring_pair, |(a, b)| {
+            black_box(a.intersection_len(b));
+        }),
+    );
+    bench_all(
+        c,
+        "is_disjoint",
+        &inputs,
+        imp(pair, |(a, b)| {
+            black_box(a.is_disjoint(b));
+        }),
+        imp(fixed_pair, |(a, b)| {
+            black_box(a.is_disjoint(b));
+        }),
+        imp(roaring_pair, |(a, b)| {
+            black_box(a.is_disjoint(b));
+        }),
+    );
+
+    // Encoding a set into a new buffer.
+    let mut group = c.benchmark_group("bitset/serialize");
     for input in &inputs {
         let set = offset(&input.bits);
         group.bench_function(BenchmarkId::new("OffsetBitset", &input.name), |b| {
-            b.iter(|| black_box(black_box(&set).to_roaring()))
+            b.iter(|| black_box(encode_offset(black_box(&set))))
+        });
+        let set = roaring(&input.bits);
+        group.bench_function(BenchmarkId::new("RoaringBitmap", &input.name), |b| {
+            b.iter(|| black_box(encode_roaring(black_box(&set))))
+        });
+    }
+    group.finish();
+
+    // Decoding a set from its encoding (prepared outside of the measurement).
+    let mut group = c.benchmark_group("bitset/deserialize");
+    for input in &inputs {
+        let bytes = encode_offset(&offset(&input.bits));
+        group.bench_function(BenchmarkId::new("OffsetBitset", &input.name), |b| {
+            b.iter(|| black_box(decode_offset(black_box(&bytes))))
+        });
+        let bytes = encode_roaring(&roaring(&input.bits));
+        group.bench_function(BenchmarkId::new("RoaringBitmap", &input.name), |b| {
+            b.iter(|| black_box(decode_roaring(black_box(&bytes))))
         });
     }
     group.finish();

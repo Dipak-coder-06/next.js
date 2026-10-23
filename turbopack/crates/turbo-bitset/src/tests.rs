@@ -1,9 +1,113 @@
 use std::{collections::BTreeSet, hash::BuildHasher};
 
-use roaring::RoaringBitmap;
+use bincode::{
+    BorrowDecode, Encode,
+    config::{self, Configuration},
+    de::{
+        BorrowDecoder, DecoderImpl,
+        read::{BorrowReader, SliceReader},
+    },
+    enc::{EncoderImpl, write::Writer},
+    error::{DecodeError, EncodeError},
+};
 use rustc_hash::FxBuildHasher;
+use shrink_to_fit::ShrinkToFit;
 
 use crate::OffsetBitset;
+
+const STANDARD: Configuration = config::standard();
+
+fn encode(set: &OffsetBitset) -> Vec<u8> {
+    bincode::encode_to_vec(set, STANDARD).unwrap()
+}
+
+fn decode(bytes: &[u8]) -> Result<OffsetBitset, DecodeError> {
+    let (set, read) = bincode::decode_from_slice::<OffsetBitset, _>(bytes, STANDARD)?;
+    assert_eq!(read, bytes.len(), "trailing bytes");
+    Ok(set)
+}
+
+/// Decodes the length header of an encoding with the standard config.
+fn header(bytes: &[u8]) -> i64 {
+    bincode::decode_from_slice(bytes, STANDARD).unwrap().0
+}
+
+/// Checks that `set` round-trips through the standard and the fixed-int config, and that the
+/// standard encoding has the size of the smaller form.
+fn check_encoding(set: &OffsetBitset, expected: &BTreeSet<u32>) {
+    let bytes = encode(set);
+    let decoded = decode(&bytes).unwrap();
+    assert_eq!(&decoded, set);
+    assert_eq!(decoded.iter().collect::<BTreeSet<_>>(), *expected);
+    let (size, list) = reference_size(expected);
+    assert_eq!(bytes.len(), size);
+    assert_eq!(header(&bytes) < 0, list);
+
+    let fixint = config::standard().with_fixed_int_encoding();
+    let fixed_bytes = bincode::encode_to_vec(set, fixint).unwrap();
+    let (fixed_decoded, _): (OffsetBitset, _) =
+        bincode::decode_from_slice(&fixed_bytes, fixint).unwrap();
+    assert_eq!(&fixed_decoded, set);
+
+    // Big endian goes through the generic per-integer path.
+    let big_endian = config::standard().with_big_endian();
+    let big_bytes = bincode::encode_to_vec(set, big_endian).unwrap();
+    assert_eq!(big_bytes.len(), bytes.len());
+    let (big_decoded, _): (OffsetBitset, _) =
+        bincode::decode_from_slice(&big_bytes, big_endian).unwrap();
+    assert_eq!(&big_decoded, set);
+}
+
+/// Size of a bincode varint.
+fn varint_len(value: u64) -> usize {
+    if value <= 250 {
+        1
+    } else if value <= u16::MAX as u64 {
+        3
+    } else if value <= u32::MAX as u64 {
+        5
+    } else {
+        9
+    }
+}
+
+/// Size of a zigzag-encoded signed varint.
+fn signed_varint_len(value: i64) -> usize {
+    varint_len(if value < 0 {
+        value.unsigned_abs() * 2 - 1
+    } else {
+        value as u64 * 2
+    })
+}
+
+/// The sizes of the list and bitmap encodings of `bits` with the standard config, computed
+/// independently of the implementation.
+fn reference_sizes(bits: &BTreeSet<u32>) -> Option<(usize, usize)> {
+    let (Some(&first), Some(&last)) = (bits.first(), bits.last()) else {
+        return None;
+    };
+    let first_byte = first as u64 / 8;
+    let len = last as u64 / 8 - first_byte + 1;
+    let bitmap = signed_varint_len(len as i64) + varint_len(first_byte) + len as usize;
+    let mut list = signed_varint_len(-(bits.len() as i64)) + varint_len(first as u64);
+    for (a, b) in bits.iter().zip(bits.iter().skip(1)) {
+        list += varint_len((b - a) as u64);
+    }
+    Some((list, bitmap))
+}
+
+/// The size of the encoding of `bits` with the standard config computed independently of the
+/// implementation, and whether it uses the list form.
+fn reference_size(bits: &BTreeSet<u32>) -> (usize, bool) {
+    let Some((list, bitmap)) = reference_sizes(bits) else {
+        return (1, false);
+    };
+    if list < bitmap {
+        (list, true)
+    } else {
+        (bitmap, false)
+    }
+}
 
 /// Checks every read operation of `set` against the reference `expected`.
 fn check(set: &OffsetBitset, expected: &BTreeSet<u32>) {
@@ -28,13 +132,7 @@ fn check(set: &OffsetBitset, expected: &BTreeSet<u32>) {
             "contains({bit})"
         );
     }
-    let roaring = set.to_roaring();
-    assert_eq!(
-        roaring.iter().collect::<Vec<_>>(),
-        expected.iter().copied().collect::<Vec<_>>()
-    );
-    // Same internal representation as inserting the bits.
-    assert_eq!(roaring, expected.iter().copied().collect::<RoaringBitmap>());
+    check_encoding(set, expected);
     // Rebuilding from the bits gives an equal set.
     let rebuilt = expected.iter().copied().collect::<OffsetBitset>();
     assert_eq!(&rebuilt, set);
@@ -485,39 +583,391 @@ fn superset_differential_over_chunk_lengths() {
 }
 
 #[test]
-fn to_roaring() {
-    // Bits spanning several containers, and the highest possible bits. (A set with both bit 0 and
-    // `u32::MAX` would allocate 512 MiB, as the set is meant for bounded ranges.)
+fn encoding_edge_cases() {
+    // The empty set, single bits, the bounds of the range, a full block, sets with an offset, and
+    // bits spanning several bytes. (A set with both bit 0 and `u32::MAX` would allocate 512 MiB,
+    // as the set is meant for bounded ranges.)
     for bits in [
-        &[0, 1, 63, 64, 65_535, 65_536, 1 << 20][..],
+        &[][..],
+        &[0],
+        &[7],
+        &[8],
+        &[u32::MAX],
         &[u32::MAX - 70_000, u32::MAX - 1, u32::MAX],
+        &[0, 1, 63, 64, 65_535, 65_536],
+        &(0..64).collect::<Vec<_>>(),
+        &(1_000..1_064).collect::<Vec<_>>(),
+        &(4_000_000..4_000_200).step_by(3).collect::<Vec<_>>(),
     ] {
         let (set, expected) = from_bits(bits);
-        let roaring = set.to_roaring();
-        assert_eq!(roaring, expected.iter().copied().collect::<RoaringBitmap>());
+        check(&set, &expected);
+    }
+    assert_eq!(encode(&OffsetBitset::new()), [0]);
+}
+
+#[test]
+fn encoding_chooses_the_smaller_form() {
+    // A single high bit is much smaller as a list than as a bitmap.
+    let (set, expected) = from_bits(&[4_000_000_000]);
+    assert_eq!(reference_size(&expected), (6, true));
+    assert_eq!(encode(&set).len(), 6);
+    // A full block is smaller as a bitmap.
+    let (set, expected) = from_bits(&(0..64).collect::<Vec<_>>());
+    assert_eq!(reference_size(&expected), (10, false));
+    assert_eq!(encode(&set).len(), 10);
+    // The sign of the header tells the form.
+    let list = encode(&from_bits(&[1, 300, 9_000]).0);
+    assert!(header(&list) < 0);
+    let bitmap = encode(&from_bits(&[1, 2, 3, 5, 8, 13]).0);
+    assert!(header(&bitmap) > 0);
+    // A bitmap with a multi-byte header (whose first byte is the odd varint marker 251).
+    let large_bitmap = encode(&(0..1_024).collect::<OffsetBitset>());
+    assert_eq!(large_bitmap[0], 251);
+    assert!(header(&large_bitmap) > 0);
+
+    // Random sets use both forms, and always the smaller one (checked by `check_encoding`).
+    let mut rng = Lcg(3);
+    let (mut lists, mut bitmaps) = (0, 0);
+    for round in 0..400 {
+        let universe = [16, 200, 5_000, 1 << 20][round % 4];
+        let base = [0, 1 << 31][round % 2];
+        let count = rng.next() % 300;
+        let bits = (0..count)
+            .map(|_| base + rng.next() % universe)
+            .collect::<Vec<_>>();
+        let (set, expected) = from_bits(&bits);
+        check_encoding(&set, &expected);
+        if !expected.is_empty() {
+            if reference_size(&expected).1 {
+                lists += 1;
+            } else {
+                bitmaps += 1;
+            }
+        }
+    }
+    assert!(
+        lists > 50 && bitmaps > 50,
+        "lists: {lists}, bitmaps: {bitmaps}"
+    );
+}
+
+#[test]
+fn encoding_ignores_the_storage_range() {
+    // Zero blocks around the bits don't change the encoding.
+    let trimmed = with_storage(5, vec![0b1011]);
+    let padded = with_storage(3, vec![0, 0, 0b1011, 0, 0]);
+    assert_eq!(encode(&trimmed), encode(&padded));
+    check(&padded, &bits_of(5, &[0b1011]));
+}
+
+/// Encodes a header with the standard config.
+fn raw_header(len: i64) -> Vec<u8> {
+    bincode::encode_to_vec(len, STANDARD).unwrap()
+}
+
+/// Encodes a list header followed by unsigned `u32` items with the standard config.
+fn raw_list(len: i64, items: &[u32]) -> Vec<u8> {
+    let mut bytes = raw_header(len);
+    for &item in items {
+        bytes.extend(bincode::encode_to_vec(item, STANDARD).unwrap());
+    }
+    bytes
+}
+
+/// Encodes a header, a `u32` and raw payload bytes with the standard config.
+fn raw_bitmap(len: i64, byte_offset: u32, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = raw_header(len);
+    bytes.extend(bincode::encode_to_vec(byte_offset, STANDARD).unwrap());
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+/// A bincode writer that collects the encoded bytes.
+#[derive(Default)]
+struct BytesWriter(Vec<u8>);
+
+impl Writer for BytesWriter {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), EncodeError> {
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+/// The list form produced through bincode's normal integer encoding, independent of the
+/// encoder's optimized fast paths.
+fn reference_list_encoding<C: config::Config>(bits: &[u32], config: C) -> Vec<u8> {
+    let mut encoder = EncoderImpl::new(BytesWriter::default(), config);
+    (-(bits.len() as i64)).encode(&mut encoder).unwrap();
+    let mut previous: Option<u32> = None;
+    for &bit in bits {
+        match previous {
+            None => bit.encode(&mut encoder).unwrap(),
+            Some(previous) => (bit - previous).encode(&mut encoder).unwrap(),
+        }
+        previous = Some(bit);
+    }
+    encoder.into_writer().0
+}
+
+/// The bitmap form produced from a set's bits, independent of the implementation's storage.
+fn reference_bitmap_encoding<C: config::Config>(bits: &[u32], config: C) -> Vec<u8> {
+    let first_byte = bits[0] / 8;
+    let last_byte = *bits.last().unwrap() / 8;
+    let mut payload = vec![0; (last_byte - first_byte + 1) as usize];
+    for &bit in bits {
+        payload[(bit / 8 - first_byte) as usize] |= 1 << (bit % 8);
+    }
+    let mut encoder = EncoderImpl::new(BytesWriter::default(), config);
+    (payload.len() as i64).encode(&mut encoder).unwrap();
+    first_byte.encode(&mut encoder).unwrap();
+    let mut bytes = encoder.into_writer().0;
+    bytes.extend(payload);
+    bytes
+}
+
+#[test]
+fn decoding_accepts_untrimmed_bitmaps() {
+    // Zero bytes at both ends of the payload aren't produced by the encoder, but are valid.
+    let bytes = raw_bitmap(4, 10, &[0, 0b101, 0, 0]);
+    let set = decode(&bytes).unwrap();
+    assert_eq!(set.iter().collect::<Vec<_>>(), [88, 90]);
+    assert_eq!(set, from_bits(&[88, 90]).0);
+}
+
+#[test]
+fn decoding_rejects_malformed_input() {
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("i64::MIN", raw_header(i64::MIN)),
+        ("too many items", raw_list(-(1 << 32) - 1, &[0])),
+        ("bitmap past u32", raw_bitmap(2, (1 << 29) - 1, &[1, 1])),
+        ("huge bitmap", raw_bitmap(i64::MAX, 0, &[])),
+        ("zero difference", raw_list(-2, &[5, 0])),
+        ("difference past u32", raw_list(-2, &[u32::MAX, 1])),
+        ("truncated header", vec![]),
+        ("truncated bitmap", raw_bitmap(4, 0, &[1, 2])),
+        ("truncated list", raw_list(-3, &[1, 1])),
+    ];
+    for (name, bytes) in cases {
+        assert!(decode(&bytes).is_err(), "{name} was accepted");
+    }
+
+    // Every proper prefix of valid encodings of both forms fails.
+    for bits in [
+        &[3, 900, 70_000][..],
+        &(100..300).step_by(2).collect::<Vec<_>>(),
+    ] {
+        let bytes = encode(&from_bits(bits).0);
+        for len in 0..bytes.len() {
+            assert!(decode(&bytes[..len]).is_err(), "prefix {len} of {bits:?}");
+        }
     }
 }
 
 #[test]
-fn to_roaring_container_types() {
-    // A dense container (stored as a bitmap by roaring), a sparse one (stored as an array), a
-    // container at exactly the array limit, and a range that starts in the middle of a container.
-    let bits = (0..5_000)
-        .chain(70_000..70_010)
-        .chain((2 << 16)..(2 << 16) + 4_096)
-        .chain((3 << 16) + 1_000..(3 << 16) + 9_000)
-        .collect::<Vec<u32>>();
-    let (set, expected) = from_bits(&bits);
+fn encoding_matches_reference_wire_format() {
+    // Varint boundaries of both the first item and the differences, at offsets where the list form
+    // is clearly smaller than the bitmap.
+    let lists = [
+        &[100_000, 100_250][..],
+        &[100_000, 100_251],
+        &[100_000, 165_535],
+        &[100_000, 165_536],
+        &[250, 2_250],
+        &[251, 2_251],
+        &[65_535, 67_535],
+        &[65_536, 67_536],
+        &[4_000_000_000],
+    ];
+    for bits in lists {
+        let expected = bits.iter().copied().collect::<BTreeSet<_>>();
+        assert!(reference_size(&expected).1, "{bits:?} should use list form");
+        let set = bits.iter().copied().collect::<OffsetBitset>();
+        assert_eq!(
+            encode(&set),
+            reference_list_encoding(bits, STANDARD),
+            "standard list {bits:?}"
+        );
+        let fixint = config::standard().with_fixed_int_encoding();
+        assert_eq!(
+            bincode::encode_to_vec(&set, fixint).unwrap(),
+            reference_list_encoding(bits, fixint),
+            "fixint list {bits:?}"
+        );
+    }
+
+    let bitmaps = [
+        &(0..64).collect::<Vec<_>>()[..],
+        &(8..72).step_by(2).collect::<Vec<_>>(),
+        &(1_000..1_064).collect::<Vec<_>>(),
+    ];
+    for bits in bitmaps {
+        let expected = bits.iter().copied().collect::<BTreeSet<_>>();
+        assert!(
+            !reference_size(&expected).1,
+            "{bits:?} should use bitmap form"
+        );
+        let set = bits.iter().copied().collect::<OffsetBitset>();
+        assert_eq!(
+            encode(&set),
+            reference_bitmap_encoding(bits, STANDARD),
+            "standard bitmap {bits:?}"
+        );
+        let fixint = config::standard().with_fixed_int_encoding();
+        assert_eq!(
+            bincode::encode_to_vec(&set, fixint).unwrap(),
+            reference_bitmap_encoding(bits, fixint),
+            "fixint bitmap {bits:?}"
+        );
+    }
+}
+
+#[test]
+fn encoding_ties_use_bitmap_form() {
+    // Search a small deterministic space for sets where both forms have the same size.
+    let mut ties = 0;
+    'search: for first in (0..1_000).step_by(7) {
+        for gap in 1..100 {
+            let bits = [first, first + gap];
+            let expected = bits.iter().copied().collect::<BTreeSet<_>>();
+            let (list, bitmap) = reference_sizes(&expected).unwrap();
+            if list == bitmap {
+                ties += 1;
+                let set = bits.iter().copied().collect::<OffsetBitset>();
+                assert_eq!(
+                    encode(&set),
+                    reference_bitmap_encoding(&bits, STANDARD),
+                    "tie {bits:?}"
+                );
+                if ties == 20 {
+                    break 'search;
+                }
+            }
+        }
+    }
+    assert_eq!(ties, 20);
+}
+
+#[test]
+fn borrow_decode_matches_decode() {
+    for bits in [
+        &[][..],
+        &[8],
+        &[4_000_000_000],
+        &(0..300).collect::<Vec<_>>(),
+    ] {
+        let set = bits.iter().copied().collect::<OffsetBitset>();
+        let bytes = encode(&set);
+        let mut decoder = DecoderImpl::new(SliceReader::new(&bytes), STANDARD, ());
+        let decoded = OffsetBitset::borrow_decode(&mut decoder).unwrap();
+        assert_eq!(decoded, set);
+        assert!(decoder.borrow_reader().take_bytes(1).is_err());
+    }
+}
+
+#[test]
+fn decoding_claims_the_storage_from_the_limit() {
+    let limited = config::standard().with_limit::<64>();
+    let decode_limited = |bytes: &[u8]| {
+        bincode::decode_from_slice::<OffsetBitset, _>(bytes, limited).map(|(set, _)| set)
+    };
+    // Two bits far apart need a large storage even though the list form is tiny.
+    let far_apart = encode(&from_bits(&[0, 1 << 20]).0);
+    assert!(far_apart.len() < 10);
+    assert!(matches!(
+        decode_limited(&far_apart),
+        Err(DecodeError::LimitExceeded)
+    ));
+    // A bitmap larger than the limit.
+    let big = encode(&(0..1_000).collect::<OffsetBitset>());
+    assert!(matches!(
+        decode_limited(&big),
+        Err(DecodeError::LimitExceeded)
+    ));
+    // Small sets fit into the limit.
+    let small = from_bits(&[3, 70, 100]).0;
+    assert_eq!(decode_limited(&encode(&small)).unwrap(), small);
+}
+
+/// Checks the binary operations of two sets against the reference sets.
+fn check_operations(
+    a: &OffsetBitset,
+    a_expected: &BTreeSet<u32>,
+    b: &OffsetBitset,
+    b_expected: &BTreeSet<u32>,
+) {
+    let intersection = a_expected
+        .intersection(b_expected)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    check(&(a & b), &intersection);
+    assert_eq!(a.intersection_len(b), intersection.len());
+    assert_eq!(a.is_disjoint(b), intersection.is_empty());
+    let difference = a_expected
+        .difference(b_expected)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    check(&(a - b), &difference);
+}
+
+#[test]
+fn operations_on_disjoint_and_shifted_ranges() {
+    let sets = [
+        &[][..],
+        &[5],
+        &[5, 64, 200],
+        &[1_000, 1_001, 5_000],
+        &[64, 65, 66, 1_000],
+        &(0..300).collect::<Vec<_>>(),
+    ];
+    for a in sets {
+        for b in sets {
+            let (a, a_expected) = from_bits(a);
+            let (b, b_expected) = from_bits(b);
+            check_operations(&a, &a_expected, &b, &b_expected);
+        }
+    }
+    // Storage with zero blocks around the bits.
+    let a = with_storage(2, vec![0, 0b110, 0]);
+    let b = with_storage(0, vec![0, 0, 0, 0b011, 0]);
+    check_operations(
+        &a,
+        &bits_of(2, &[0, 0b110, 0]),
+        &b,
+        &bits_of(0, &[0, 0, 0, 0b011]),
+    );
+}
+
+#[test]
+fn remove() {
+    let (mut set, mut expected) = from_bits(&[3, 64, 200]);
+    assert!(set.remove(64));
+    assert!(!set.remove(64));
+    assert!(!set.remove(1_000_000));
+    assert!(!set.remove(0));
+    expected.remove(&64);
     check(&set, &expected);
-    let roaring = set.to_roaring();
-    let inserted = bits.iter().copied().collect::<RoaringBitmap>();
-    assert_eq!(roaring, inserted);
-    // The serialization (which `RoaringBitmapWrapper` uses for hashing) is identical too.
-    let mut a = Vec::new();
-    let mut b = Vec::new();
-    roaring.serialize_into(&mut a).unwrap();
-    inserted.serialize_into(&mut b).unwrap();
-    assert_eq!(a, b);
+    assert!(set.remove(3));
+    assert!(set.remove(200));
+    check(&set, &BTreeSet::new());
+    assert_eq!(set, OffsetBitset::new());
+    assert_eq!(hash(&set), hash(&OffsetBitset::new()));
+}
+
+#[test]
+fn shrink_to_fit() {
+    let mut set = with_storage(2, vec![0, 0b110, 0, 0]);
+    set.blocks.reserve(100);
+    let expected = bits_of(2, &[0, 0b110]);
+    set.shrink_to_fit();
+    check(&set, &expected);
+    assert_eq!((set.offset, set.blocks.len()), (3, 1));
+    // `Vec::shrink_to_fit` doesn't promise an exact capacity, but it drops the reserved space.
+    assert!(set.blocks.capacity() < 100);
+
+    let mut empty = with_storage(5, vec![0, 0]);
+    empty.shrink_to_fit();
+    assert_eq!(empty.blocks.capacity(), 0);
+    check(&empty, &BTreeSet::new());
 }
 
 /// A small deterministic linear congruential generator, so the test needs no random number crate.
@@ -555,6 +1005,8 @@ fn differential() {
         let (b, b_expected) = gen_set(&mut rng);
         check(&a, &a_expected);
         check(&b, &b_expected);
+        check_operations(&a, &a_expected, &b, &b_expected);
+        check_operations(&b, &b_expected, &a, &a_expected);
 
         let is_superset = a_expected.is_superset(&b_expected);
         assert_eq!(a.is_superset(&b), is_superset);
@@ -602,6 +1054,8 @@ fn differential_dense() {
         };
         check(&a, &a_expected);
         check(&b, &b_expected);
+        check_operations(&a, &a_expected, &b, &b_expected);
+        check_operations(&b, &b_expected, &a, &a_expected);
 
         let is_superset = a_expected.is_superset(&b_expected);
         assert_eq!(a.is_superset(&b), is_superset);

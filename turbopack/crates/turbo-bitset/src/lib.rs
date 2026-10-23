@@ -8,14 +8,20 @@
 //! Compared to a `RoaringBitmap`, which is optimized for compact storage, every operation is a
 //! simple loop over machine words. That makes unions and subset checks fast when the bits span a
 //! limited range, at the cost of using one bit of memory per index in that range.
+//!
+//! The bincode encoding (see the `encode` module) stores either the trimmed bytes of the range or
+//! the delta-encoded list of bits, whichever is smaller, so sparse sets stay compact when
+//! persisted.
+
+mod encode;
 
 use std::{
     fmt,
     hash::{Hash, Hasher},
-    ops::BitOrAssign,
+    ops::{BitAnd, BitOrAssign, Sub},
 };
 
-use roaring::RoaringBitmap;
+use shrink_to_fit::ShrinkToFit;
 
 /// Number of bits per storage block.
 const BLOCK_BITS: usize = usize::BITS as usize;
@@ -142,6 +148,21 @@ impl OffsetBitset {
         let added = *block & mask == 0;
         *block |= mask;
         added
+    }
+
+    /// Removes `bit` from the set. Returns whether it was in the set.
+    ///
+    /// This never shrinks the storage.
+    pub fn remove(&mut self, bit: u32) -> bool {
+        let bit = bit as usize;
+        let Some(position) = self.position(bit / BLOCK_BITS) else {
+            return false;
+        };
+        let mask = 1 << (bit % BLOCK_BITS);
+        let block = &mut self.blocks[position];
+        let removed = *block & mask != 0;
+        *block &= !mask;
+        removed
     }
 
     /// Returns whether `bit` is in the set.
@@ -285,60 +306,92 @@ impl OffsetBitset {
         superset && strict
     }
 
-    /// Converts the set into a [`RoaringBitmap`] with the same bits.
-    ///
-    /// This builds every roaring container (a range of 2^16 bits) directly from the stored blocks
-    /// instead of inserting each bit, and produces the same container types as inserting the bits
-    /// one by one would, so the result is equal (and serializes identically) to an inserted one.
-    pub fn to_roaring(&self) -> RoaringBitmap {
-        /// The number of blocks per roaring container.
-        const CONTAINER_BLOCKS: usize = (1 << 16) / BLOCK_BITS;
-        /// Roaring stores a container with up to this many bits as a sorted array.
-        const ROARING_ARRAY_LIMIT: u32 = 4096;
+    /// The blocks of both sets over the range of block indices stored in both, and the index of
+    /// the first of them. Bits outside of this range are in at most one of the sets.
+    fn overlap<'a>(&'a self, other: &'a Self) -> (usize, &'a [usize], &'a [usize]) {
+        let start = self.offset.max(other.offset);
+        let end = self.end().min(other.end());
+        if start >= end {
+            return (start, &[], &[]);
+        }
+        (
+            start,
+            &self.blocks[start - self.offset..end - self.offset],
+            &other.blocks[start - other.offset..end - other.offset],
+        )
+    }
 
-        let (first_block, blocks) = self.trimmed();
-        let end = first_block + blocks.len();
-        let mut result = RoaringBitmap::new();
-        let mut bytes = Vec::new();
-        let mut index = first_block;
-        while index < end {
-            let chunk_end = ((index / CONTAINER_BLOCKS + 1) * CONTAINER_BLOCKS).min(end);
-            let chunk = &blocks[index - first_block..chunk_end - first_block];
-            let count = chunk.iter().map(|b| b.count_ones()).sum::<u32>();
-            let part = if count == 0 {
-                None
-            } else if count == ROARING_ARRAY_LIMIT {
-                // `from_lsb0_bytes` stores exactly this many bits as a bitmap, but inserting them
-                // stores them as an array, so insert them instead.
-                let bits = Iter {
-                    blocks: chunk,
-                    block_index: index,
-                    current: 0,
-                };
-                Some(
-                    RoaringBitmap::from_sorted_iter(bits)
-                        .expect("the bits of an OffsetBitset are iterated in ascending order"),
-                )
-            } else {
-                bytes.clear();
-                bytes.extend(chunk.iter().flat_map(|block| block.to_le_bytes()));
-                // A chunk is at most one container, so the range fits into `u32`.
-                Some(RoaringBitmap::from_lsb0_bytes(
-                    (index * BLOCK_BITS) as u32,
-                    &bytes,
-                ))
-            };
-            if let Some(part) = part {
-                if result.is_empty() {
-                    result = part;
-                } else {
-                    // The parts are in different containers, so this only adds containers.
-                    result |= part;
-                }
-            }
-            index = chunk_end;
+    /// Returns the set of bits that are in both sets.
+    pub fn intersection(&self, other: &Self) -> Self {
+        let (start, a, b) = self.overlap(other);
+        let blocks: Vec<usize> = a.iter().zip(b).map(|(&a, &b)| a & b).collect();
+        if blocks.is_empty() {
+            return Self::new();
+        }
+        Self {
+            offset: start,
+            blocks,
+        }
+    }
+
+    /// Returns the set of bits that are in the set but not in `other`.
+    pub fn difference(&self, other: &Self) -> Self {
+        let mut result = self.clone();
+        let (start, _, b) = self.overlap(other);
+        if b.is_empty() {
+            return result;
+        }
+        let position = start - self.offset;
+        for (block, &other_block) in result.blocks[position..].iter_mut().zip(b) {
+            *block &= !other_block;
         }
         result
+    }
+
+    /// Returns whether the sets have no bit in common.
+    pub fn is_disjoint(&self, other: &Self) -> bool {
+        let (_, a, b) = self.overlap(other);
+        a.iter().zip(b).all(|(&a, &b)| a & b == 0)
+    }
+
+    /// Returns the number of bits that are in both sets.
+    pub fn intersection_len(&self, other: &Self) -> usize {
+        let (_, a, b) = self.overlap(other);
+        a.iter()
+            .zip(b)
+            .map(|(&a, &b)| (a & b).count_ones() as usize)
+            .sum()
+    }
+}
+
+impl BitAnd for &OffsetBitset {
+    type Output = OffsetBitset;
+
+    fn bitand(self, rhs: Self) -> OffsetBitset {
+        self.intersection(rhs)
+    }
+}
+
+impl Sub for &OffsetBitset {
+    type Output = OffsetBitset;
+
+    fn sub(self, rhs: Self) -> OffsetBitset {
+        self.difference(rhs)
+    }
+}
+
+impl ShrinkToFit for OffsetBitset {
+    /// Drops the leading and trailing zero blocks of the storage and releases its spare capacity.
+    fn shrink_to_fit(&mut self) {
+        let Some(first) = self.blocks.iter().position(|&b| b != 0) else {
+            *self = Self::new();
+            return;
+        };
+        let last = self.blocks.iter().rposition(|&b| b != 0).unwrap_or(first);
+        self.blocks.truncate(last + 1);
+        self.blocks.drain(..first);
+        self.offset += first;
+        self.blocks.shrink_to_fit();
     }
 }
 
